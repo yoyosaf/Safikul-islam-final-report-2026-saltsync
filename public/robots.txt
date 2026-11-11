@@ -1,0 +1,9 @@
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /portal
+Disallow: /employee-report
+Disallow: /tl-report
+Disallow: /physical-support-maker
+
+Sitemap: /sitemap.xml

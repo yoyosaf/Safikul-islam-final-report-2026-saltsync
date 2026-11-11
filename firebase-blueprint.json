@@ -1,0 +1,82 @@
+{
+  "entities": {
+    "Employee": {
+      "title": "Employee",
+      "description": "An employee in the system.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "Full name of the employee" },
+        "eid": { "type": "string", "description": "Unique employee ID" }
+      },
+      "required": ["name", "eid"]
+    },
+    "EmployeeReport": {
+      "title": "Employee Report",
+      "description": "A daily report submitted by an employee.",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string", "description": "Date of the report (DD.MM.YYYY)" },
+        "name": { "type": "string", "description": "Employee name" },
+        "employee_id": { "type": "string", "description": "Employee ID" },
+        "shift": { "type": "string", "description": "Shift name" },
+        "issues": { "type": "integer", "description": "Total issues received" },
+        "physical_support": { "type": "integer", "description": "Physical support count" },
+        "regular_issues": { "type": "integer", "description": "Regular issues count" },
+        "processing": { "type": "integer", "description": "Issues still processing" },
+        "solved": { "type": "integer", "description": "Total issues solved" },
+        "special_task": { "type": "string", "description": "Special task or notes" },
+        "report_content": { "type": "string", "description": "Full text of the report" },
+        "ts": { "type": "integer", "description": "Timestamp" }
+      },
+      "required": ["date", "name", "employee_id", "shift", "issues", "report_content", "ts"]
+    },
+    "TLReport": {
+      "title": "TL Report",
+      "description": "A daily report submitted by a Team Leader.",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string", "description": "Date of the report" },
+        "tl_name": { "type": "string", "description": "TL name" },
+        "shift": { "type": "string", "description": "Shift name" },
+        "issues": { "type": "integer", "description": "Total issues received" },
+        "solved": { "type": "integer", "description": "Total issues solved" },
+        "processing": { "type": "integer", "description": "Issues still processing" },
+        "physical_total": { "type": "integer", "description": "Total physical support" },
+        "physical_complete": { "type": "integer", "description": "Completed physical support" },
+        "physical_shift": { "type": "integer", "description": "Shifted physical support" },
+        "physical_cancel": { "type": "integer", "description": "Cancelled physical support" },
+        "processing_persons": { "type": "string", "description": "Persons responsible for processing" },
+        "report_content": { "type": "string", "description": "Full text of the report" },
+        "ts": { "type": "integer", "description": "Timestamp" }
+      },
+      "required": ["date", "tl_name", "shift", "issues", "report_content", "ts"]
+    },
+    "AppSettings": {
+      "title": "App Settings",
+      "description": "Global application settings.",
+      "type": "object",
+      "properties": {
+        "notification": { "type": "string", "description": "Banner notification message" },
+        "adminPass": { "type": "string", "description": "Admin password" }
+      }
+    }
+  },
+  "firestore": {
+    "/employees/{empId}": {
+      "schema": "Employee",
+      "description": "Collection of employees"
+    },
+    "/emp_reports/{reportId}": {
+      "schema": "EmployeeReport",
+      "description": "Collection of employee reports"
+    },
+    "/tl_reports/{reportId}": {
+      "schema": "TLReport",
+      "description": "Collection of TL reports"
+    },
+    "/settings/global": {
+      "schema": "AppSettings",
+      "description": "Global settings document"
+    }
+  }
+}
