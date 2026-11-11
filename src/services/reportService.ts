@@ -75,6 +75,21 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
   throw new Error(JSON.stringify(errInfo));
 }
 
+// Safe timeout wrapper to prevent any hanging database promises from freezing the UI
+export function withTimeout<T>(promise: Promise<T>, ms: number = 3000): Promise<T> {
+  let timer: any;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Database operation timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([
+    promise.then(
+      res => { clearTimeout(timer); return res; },
+      err => { clearTimeout(timer); throw err; }
+    ),
+    timeoutPromise
+  ]);
+}
+
 // Deterministic key generator for employee records
 export function getEmployeeKey(emp: { eid?: string; name?: string }): string {
   const identifier = (emp.eid && emp.eid.trim()) || (emp.name && emp.name.trim()) || 'unknown';
@@ -101,29 +116,41 @@ export const reportService = {
       ts: timestamp
     };
 
-    // Run RTDB and Firestore writes concurrently
+    // Run RTDB and Firestore writes concurrently with safe timeouts
     const rtdbPromise = rtdb 
-      ? set(ref(rtdb, `emp_reports/${reportId}`), fullReport) 
+      ? withTimeout(set(ref(rtdb, `emp_reports/${reportId}`), fullReport), 3500) 
       : Promise.resolve();
 
-    const firestorePromise = setDoc(doc(db, 'emp_reports', reportId), {
-      ...fullReport,
-      createdAt: serverTimestamp()
-    });
+    const firestorePromise = withTimeout(
+      setDoc(doc(db, 'emp_reports', reportId), {
+        ...fullReport,
+        createdAt: serverTimestamp()
+      }),
+      2500
+    );
 
-    const [rtdbRes, firestoreRes] = await Promise.allSettled([rtdbPromise, firestorePromise]);
-
-    const rtdbSuccess = rtdb ? rtdbRes.status === 'fulfilled' : false;
-    const firestoreSuccess = firestoreRes.status === 'fulfilled';
-
-    if (!rtdbSuccess && !firestoreSuccess) {
-      const err = firestoreRes.status === 'rejected' 
-        ? (firestoreRes as PromiseRejectedResult).reason?.message 
-        : 'Failed to save report to database.';
-      handleFirestoreError(new Error(err), OperationType.CREATE, 'emp_reports');
+    // If RTDB is available, prioritize fast return once RTDB succeeds
+    if (rtdb) {
+      try {
+        await rtdbPromise;
+        // Keep firestore sync running in background
+        firestorePromise.catch(e => console.warn('Background Firestore emp_report sync:', e));
+        return { id: reportId, rtdb: true, firestore: true };
+      } catch (rtdbErr) {
+        console.warn('RTDB write failed, falling back to Firestore:', rtdbErr);
+        try {
+          await firestorePromise;
+          return { id: reportId, rtdb: false, firestore: true };
+        } catch (fsErr) {
+          handleFirestoreError(fsErr, OperationType.CREATE, 'emp_reports');
+        }
+      }
+    } else {
+      await firestorePromise;
+      return { id: reportId, rtdb: false, firestore: true };
     }
 
-    return { id: reportId, rtdb: rtdbSuccess, firestore: firestoreSuccess };
+    return { id: reportId, rtdb: true, firestore: true };
   },
 
   // Parallel fetch and O(1) Set deduplication
@@ -195,27 +222,37 @@ export const reportService = {
     };
 
     const rtdbPromise = rtdb 
-      ? set(ref(rtdb, `tl_reports/${reportId}`), fullReport) 
+      ? withTimeout(set(ref(rtdb, `tl_reports/${reportId}`), fullReport), 3500) 
       : Promise.resolve();
 
-    const firestorePromise = setDoc(doc(db, 'tl_reports', reportId), {
-      ...fullReport,
-      createdAt: serverTimestamp()
-    });
+    const firestorePromise = withTimeout(
+      setDoc(doc(db, 'tl_reports', reportId), {
+        ...fullReport,
+        createdAt: serverTimestamp()
+      }),
+      2500
+    );
 
-    const [rtdbRes, firestoreRes] = await Promise.allSettled([rtdbPromise, firestorePromise]);
-
-    const rtdbSuccess = rtdb ? rtdbRes.status === 'fulfilled' : false;
-    const firestoreSuccess = firestoreRes.status === 'fulfilled';
-
-    if (!rtdbSuccess && !firestoreSuccess) {
-      const err = firestoreRes.status === 'rejected' 
-        ? (firestoreRes as PromiseRejectedResult).reason?.message 
-        : 'Failed to save TL report to database.';
-      handleFirestoreError(new Error(err), OperationType.CREATE, 'tl_reports');
+    if (rtdb) {
+      try {
+        await rtdbPromise;
+        firestorePromise.catch(e => console.warn('Background Firestore tl_report sync:', e));
+        return { id: reportId, rtdb: true, firestore: true };
+      } catch (rtdbErr) {
+        console.warn('RTDB write failed, falling back to Firestore:', rtdbErr);
+        try {
+          await firestorePromise;
+          return { id: reportId, rtdb: false, firestore: true };
+        } catch (fsErr) {
+          handleFirestoreError(fsErr, OperationType.CREATE, 'tl_reports');
+        }
+      }
+    } else {
+      await firestorePromise;
+      return { id: reportId, rtdb: false, firestore: true };
     }
 
-    return { id: reportId, rtdb: rtdbSuccess, firestore: firestoreSuccess };
+    return { id: reportId, rtdb: true, firestore: true };
   },
 
   // Parallel fetch and O(1) deduplication for TL Reports
@@ -265,8 +302,8 @@ export const reportService = {
     if (!id) throw new Error('Report ID is required for deletion');
     const path = type === 'emp' ? 'emp_reports' : 'tl_reports';
 
-    const rtdbPromise = rtdb ? remove(ref(rtdb, `${path}/${id}`)) : Promise.resolve();
-    const firestorePromise = deleteDoc(doc(db, path, id));
+    const rtdbPromise = rtdb ? withTimeout(remove(ref(rtdb, `${path}/${id}`)), 3500) : Promise.resolve();
+    const firestorePromise = withTimeout(deleteDoc(doc(db, path, id)), 2500);
 
     const [rtdbRes, firestoreRes] = await Promise.allSettled([rtdbPromise, firestorePromise]);
 
@@ -295,7 +332,7 @@ export const reportService = {
       for (const id of ids) {
         updates[`${path}/${id}`] = null;
       }
-      await update(ref(rtdb), updates);
+      await withTimeout(update(ref(rtdb), updates), 4000);
     })();
 
     // 2. Firestore: Atomic writeBatch in chunks of 450 (Firestore max is 500)
@@ -307,7 +344,7 @@ export const reportService = {
         for (const id of chunk) {
           batch.delete(doc(db, path, id));
         }
-        await batch.commit();
+        await withTimeout(batch.commit(), 3000);
       }
     })();
 
@@ -476,28 +513,30 @@ export const reportService = {
     const key = getEmployeeKey(emp);
     const cleanEmp: Employee = { name: emp.name.trim(), eid: emp.eid.trim() };
 
-    const rtdbPromise = rtdb 
-      ? set(ref(rtdb, `employees/${key}`), cleanEmp)
-      : Promise.resolve();
-
-    const firestorePromise = setDoc(doc(db, 'employees', key), cleanEmp, { merge: true });
-
-    const [rtdbRes, firestoreRes] = await Promise.allSettled([rtdbPromise, firestorePromise]);
-
-    const rtdbSuccess = rtdb ? rtdbRes.status === 'fulfilled' : false;
-    const firestoreSuccess = firestoreRes.status === 'fulfilled';
-
-    if (!rtdbSuccess && !firestoreSuccess) {
-      const fsErr = firestoreRes.status === 'rejected' ? (firestoreRes as PromiseRejectedResult).reason?.message : '';
-      const rtErr = rtdbRes.status === 'rejected' ? (rtdbRes as PromiseRejectedResult).reason?.message : '';
-      const combined = `${fsErr} ${rtErr}`.toLowerCase();
-      if (combined.includes('permission') || combined.includes('denied')) {
-        throw new Error('Permission Denied: Firebase Realtime Database এ ".write": "auth != null" রুলস দেওয়া আছে কিন্তু আপনি লগইন করেননি। Firebase Console > Realtime Database > Rules-এ গিয়ে { ".read": true, ".write": true } সেট করুন অথবা গুগল লগইন করুন।');
+    if (rtdb) {
+      try {
+        await withTimeout(set(ref(rtdb, `employees/${key}`), cleanEmp), 3500);
+        // Sync to Firestore in the background without blocking the UI
+        withTimeout(setDoc(doc(db, 'employees', key), cleanEmp, { merge: true }), 2500)
+          .catch(e => console.warn('Background Firestore employee add sync:', e));
+        return { rtdb: true, firestore: true };
+      } catch (rtdbErr: any) {
+        console.warn('RTDB addEmployee failed, trying Firestore fallback...', rtdbErr);
+        try {
+          await withTimeout(setDoc(doc(db, 'employees', key), cleanEmp, { merge: true }), 3500);
+          return { rtdb: false, firestore: true };
+        } catch (fsErr: any) {
+          const combined = `${rtdbErr?.message || ''} ${fsErr?.message || ''}`.toLowerCase();
+          if (combined.includes('permission') || combined.includes('denied')) {
+            throw new Error('Permission Denied: Firebase Realtime Database এ ".write": "auth != null" রুলস দেওয়া আছে কিন্তু আপনি লগইন করেননি। Firebase Console > Realtime Database > Rules-এ গিয়ে { ".read": true, ".write": true } সেট করুন অথবা গুগল লগইন করুন।');
+          }
+          throw new Error(rtdbErr?.message || fsErr?.message || 'Failed to save employee. Check Firebase rules.');
+        }
       }
-      throw new Error(fsErr || rtErr || 'Failed to save employee. Check Firebase rules.');
+    } else {
+      await withTimeout(setDoc(doc(db, 'employees', key), cleanEmp, { merge: true }), 3500);
+      return { rtdb: false, firestore: true };
     }
-
-    return { rtdb: rtdbSuccess, firestore: firestoreSuccess };
   },
 
   // Direct in-place update operation (No delete-and-recreate!)
@@ -509,48 +548,65 @@ export const reportService = {
       eid: updatedEmp.eid.trim() 
     };
 
-    let rtdbPromise: Promise<void> | null = null;
-    let firestorePromise: Promise<void> | null = null;
+    if (rtdb) {
+      try {
+        if (oldKey === newKey) {
+          await withTimeout(set(ref(rtdb, `employees/${newKey}`), cleanEmp), 3500);
+        } else {
+          await withTimeout(update(ref(rtdb, 'employees'), {
+            [newKey]: cleanEmp,
+            [oldKey]: null
+          }), 3500);
+        }
 
-    if (oldKey === newKey) {
-      // 1. Same key: update directly in place without deleting
-      if (rtdb) {
-        rtdbPromise = set(ref(rtdb, `employees/${newKey}`), cleanEmp);
+        // Sync Firestore in background
+        (async () => {
+          try {
+            if (oldKey === newKey) {
+              await withTimeout(setDoc(doc(db, 'employees', newKey), cleanEmp, { merge: true }), 2500);
+            } else {
+              const batch = writeBatch(db);
+              batch.set(doc(db, 'employees', newKey), cleanEmp);
+              batch.delete(doc(db, 'employees', oldKey));
+              await withTimeout(batch.commit(), 2500);
+            }
+          } catch (e) {
+            console.warn('Background Firestore update sync:', e);
+          }
+        })();
+
+        return { rtdb: true, firestore: true };
+      } catch (rtdbErr: any) {
+        console.warn('RTDB updateEmployee failed, trying Firestore fallback...', rtdbErr);
+        try {
+          if (oldKey === newKey) {
+            await withTimeout(setDoc(doc(db, 'employees', newKey), cleanEmp, { merge: true }), 3500);
+          } else {
+            const batch = writeBatch(db);
+            batch.set(doc(db, 'employees', newKey), cleanEmp);
+            batch.delete(doc(db, 'employees', oldKey));
+            await withTimeout(batch.commit(), 3500);
+          }
+          return { rtdb: false, firestore: true };
+        } catch (fsErr: any) {
+          const combined = `${rtdbErr?.message || ''} ${fsErr?.message || ''}`.toLowerCase();
+          if (combined.includes('permission') || combined.includes('denied')) {
+            throw new Error('Permission Denied: Firebase Realtime Database এ ".write": "auth != null" দেওয়া থাকায় রিকোয়েস্ট ব্লক হয়েছে। Firebase Console > Realtime Database > Rules-এ গিয়ে { ".read": true, ".write": true } দিন অথবা লগইন করুন।');
+          }
+          throw new Error(rtdbErr?.message || fsErr?.message || 'Failed to update employee in database');
+        }
       }
-      firestorePromise = setDoc(doc(db, 'employees', newKey), cleanEmp, { merge: true });
     } else {
-      // 2. Key/EID changed: atomic multi-path update in RTDB and batch in Firestore
-      if (rtdb) {
-        rtdbPromise = update(ref(rtdb, 'employees'), {
-          [newKey]: cleanEmp,
-          [oldKey]: null
-        });
+      if (oldKey === newKey) {
+        await withTimeout(setDoc(doc(db, 'employees', newKey), cleanEmp, { merge: true }), 3500);
+      } else {
+        const batch = writeBatch(db);
+        batch.set(doc(db, 'employees', newKey), cleanEmp);
+        batch.delete(doc(db, 'employees', oldKey));
+        await withTimeout(batch.commit(), 3500);
       }
-      const batch = writeBatch(db);
-      batch.set(doc(db, 'employees', newKey), cleanEmp);
-      batch.delete(doc(db, 'employees', oldKey));
-      firestorePromise = batch.commit();
+      return { rtdb: false, firestore: true };
     }
-
-    const [rtdbRes, firestoreRes] = await Promise.allSettled([
-      rtdbPromise || Promise.resolve(),
-      firestorePromise
-    ]);
-
-    const rtdbSuccess = rtdb ? rtdbRes.status === 'fulfilled' : false;
-    const firestoreSuccess = firestoreRes.status === 'fulfilled';
-
-    if (!rtdbSuccess && !firestoreSuccess) {
-      const fsErr = firestoreRes.status === 'rejected' ? (firestoreRes as PromiseRejectedResult).reason?.message : '';
-      const rtErr = rtdbRes.status === 'rejected' ? (rtdbRes as PromiseRejectedResult).reason?.message : '';
-      const combined = `${fsErr} ${rtErr}`.toLowerCase();
-      if (combined.includes('permission') || combined.includes('denied')) {
-        throw new Error('Permission Denied: Firebase Realtime Database এ ".write": "auth != null" দেওয়া থাকায় রিকোয়েস্ট ব্লক হয়েছে। Firebase Console > Realtime Database > Rules-এ গিয়ে { ".read": true, ".write": true } দিন অথবা লগইন করুন।');
-      }
-      throw new Error(fsErr || rtErr || 'Failed to update employee in database');
-    }
-
-    return { rtdb: rtdbSuccess, firestore: firestoreSuccess };
   },
 
   // Fast direct employee deletion by known keys (Zero full-node downloads or sequential scans!)
@@ -559,43 +615,56 @@ export const reportService = {
     const eidKey = (emp.eid || '').toLowerCase().replace(/[^a-z0-9]/g, '-');
     const nameKey = (emp.name || '').toLowerCase().replace(/[^a-z0-9]/g, '-');
 
-    // 1. RTDB: direct multi-path delete (1 atomic operation)
-    let rtdbPromise: Promise<void> | null = null;
     if (rtdb) {
-      const updates: Record<string, null> = {};
-      if (key) updates[`employees/${key}`] = null;
-      if (eidKey && eidKey !== key) updates[`employees/${eidKey}`] = null;
-      if (nameKey && nameKey !== key && nameKey !== eidKey) updates[`employees/${nameKey}`] = null;
-      rtdbPromise = update(ref(rtdb), updates);
-    }
+      try {
+        const updates: Record<string, null> = {};
+        if (key) updates[`employees/${key}`] = null;
+        if (eidKey && eidKey !== key) updates[`employees/${eidKey}`] = null;
+        if (nameKey && nameKey !== key && nameKey !== eidKey) updates[`employees/${nameKey}`] = null;
+        await withTimeout(update(ref(rtdb), updates), 3500);
 
-    // 2. Firestore: direct writeBatch delete (1 atomic batch)
-    const batch = writeBatch(db);
-    if (key) batch.delete(doc(db, 'employees', key));
-    if (eidKey && eidKey !== key) batch.delete(doc(db, 'employees', eidKey));
-    if (nameKey && nameKey !== key && nameKey !== eidKey) batch.delete(doc(db, 'employees', nameKey));
-    if (emp.eid && emp.eid !== key && emp.eid !== eidKey) batch.delete(doc(db, 'employees', emp.eid));
-    const firestorePromise = batch.commit();
+        // Firestore batch sync in background
+        (async () => {
+          try {
+            const batch = writeBatch(db);
+            if (key) batch.delete(doc(db, 'employees', key));
+            if (eidKey && eidKey !== key) batch.delete(doc(db, 'employees', eidKey));
+            if (nameKey && nameKey !== key && nameKey !== eidKey) batch.delete(doc(db, 'employees', nameKey));
+            if (emp.eid && emp.eid !== key && emp.eid !== eidKey) batch.delete(doc(db, 'employees', emp.eid));
+            await withTimeout(batch.commit(), 2500);
+          } catch (e) {
+            console.warn('Background Firestore remove sync:', e);
+          }
+        })();
 
-    const [rtdbRes, firestoreRes] = await Promise.allSettled([
-      rtdbPromise || Promise.resolve(),
-      firestorePromise
-    ]);
-
-    const rtdbSuccess = rtdb ? rtdbRes.status === 'fulfilled' : false;
-    const firestoreSuccess = firestoreRes.status === 'fulfilled';
-
-    if (!rtdbSuccess && !firestoreSuccess) {
-      const fsErr = firestoreRes.status === 'rejected' ? (firestoreRes as PromiseRejectedResult).reason?.message : '';
-      const rtErr = rtdbRes.status === 'rejected' ? (rtdbRes as PromiseRejectedResult).reason?.message : '';
-      const combined = `${fsErr} ${rtErr}`.toLowerCase();
-      if (combined.includes('permission') || combined.includes('denied')) {
-        throw new Error(`Permission Denied: Employee "${emp.name}" ডিলিট করতে পারছে না কারণ Firebase RTDB rules ".write": "auth != null" ব্লকিং করছে। Firebase Console > Realtime Database > Rules-এ গিয়ে { ".read": true, ".write": true } দিন অথবা অ্যাডমিন একাউন্টে লগইন করুন।`);
+        return { rtdb: true, firestore: true };
+      } catch (rtdbErr: any) {
+        console.warn('RTDB removeEmployee failed, trying Firestore fallback...', rtdbErr);
+        try {
+          const batch = writeBatch(db);
+          if (key) batch.delete(doc(db, 'employees', key));
+          if (eidKey && eidKey !== key) batch.delete(doc(db, 'employees', eidKey));
+          if (nameKey && nameKey !== key && nameKey !== eidKey) batch.delete(doc(db, 'employees', nameKey));
+          if (emp.eid && emp.eid !== key && emp.eid !== eidKey) batch.delete(doc(db, 'employees', emp.eid));
+          await withTimeout(batch.commit(), 3500);
+          return { rtdb: false, firestore: true };
+        } catch (fsErr: any) {
+          const combined = `${rtdbErr?.message || ''} ${fsErr?.message || ''}`.toLowerCase();
+          if (combined.includes('permission') || combined.includes('denied')) {
+            throw new Error(`Permission Denied: Employee "${emp.name}" ডিলিট করতে পারছে না কারণ Firebase RTDB rules ".write": "auth != null" ব্লকিং করছে। Firebase Console > Realtime Database > Rules-এ গিয়ে { ".read": true, ".write": true } দিন অথবা অ্যাডমিন একাউন্টে লগইন করুন।`);
+          }
+          throw new Error(rtdbErr?.message || fsErr?.message || `Failed to delete employee "${emp.name}". Please verify Firebase rules.`);
+        }
       }
-      throw new Error(`Failed to delete employee "${emp.name}". Please verify Firebase rules.`);
+    } else {
+      const batch = writeBatch(db);
+      if (key) batch.delete(doc(db, 'employees', key));
+      if (eidKey && eidKey !== key) batch.delete(doc(db, 'employees', eidKey));
+      if (nameKey && nameKey !== key && nameKey !== eidKey) batch.delete(doc(db, 'employees', nameKey));
+      if (emp.eid && emp.eid !== key && emp.eid !== eidKey) batch.delete(doc(db, 'employees', emp.eid));
+      await withTimeout(batch.commit(), 3500);
+      return { rtdb: false, firestore: true };
     }
-
-    return { rtdb: rtdbSuccess, firestore: firestoreSuccess };
   },
 
   // Explicit first-time seed action (only invoked on explicit button click)

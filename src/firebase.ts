@@ -18,7 +18,11 @@ export const firebaseConfig = {
   messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID || winConfig?.messagingSenderId || (rootConfig as any).messagingSenderId,
   appId: env.VITE_FIREBASE_APP_ID || winConfig?.appId || (rootConfig as any).appId,
   measurementId: env.VITE_FIREBASE_MEASUREMENT_ID || winConfig?.measurementId || (rootConfig as any).measurementId,
-  firestoreDatabaseId: env.VITE_FIREBASE_DATABASE_ID || (rootConfig as any).firestoreDatabaseId,
+  firestoreDatabaseId: env.VITE_FIREBASE_DATABASE_ID || (
+    (!winConfig?.projectId || winConfig.projectId === (rootConfig as any).projectId)
+      ? (rootConfig as any).firestoreDatabaseId
+      : undefined
+  ),
 };
 
 export const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
